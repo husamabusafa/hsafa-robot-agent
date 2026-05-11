@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+logs/
+models/
+reachy_mini-main/
+data/
+checkpoints/
+node_modules/
+dist/
+.vite/
+*.egg-info/
+.pytest_cache/
