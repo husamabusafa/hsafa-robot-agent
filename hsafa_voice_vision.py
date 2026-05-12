@@ -102,26 +102,35 @@ class RobotController:
     def __init__(self, reachy) -> None:
         self.reachy = reachy
         self._emotions = None  # lazy-loaded RecordedMoves
-        self._anim_state = "idle"  # "idle", "speaking", "expression"
-        self._last_audio_time = 0.0
+        # Expression animation lock (highest priority).
+        self._expression_active = threading.Event()
+        # External speaking signal — bind gemini.is_speaking via
+        # bind_speaking_event(). When set, speaking animation runs.
+        self._speaking_event: Optional[threading.Event] = None
         self._speech_amp = 0.0
         self._stop_idle = threading.Event()
         self._idle_thread: Optional[threading.Thread] = None
 
+    def bind_speaking_event(self, event: threading.Event) -> None:
+        """Drive the speaking animation directly from a threading.Event.
+
+        Pass ``gemini.is_speaking`` so the animation matches Gemini's
+        turn boundaries exactly — no audio-silence timeouts.
+        """
+        self._speaking_event = event
+
     # ---- speaking detection ------------------------------------------------
     def notify_audio(self, samples) -> None:
-        """Call from speaker_sink whenever Gemini audio is pushed.
+        """Update the live speech amplitude used to scale motion.
 
-        samples is a numpy ndarray (float32 @ 16 kHz) from gemini_live.
+        State (speaking vs idle) is driven by the bound is_speaking
+        event — this method only adjusts how *big* the bob is.
         """
         try:
             if samples is not None and len(samples) > 0:
-                self._last_audio_time = time.time()
                 raw = float(np.abs(samples).mean())
                 scaled = min(raw * 20.0, 1.0)
-                self._speech_amp = 0.7 * self._speech_amp + 0.3 * scaled
-                if self._anim_state not in ("expression",):
-                    self._anim_state = "speaking"
+                self._speech_amp = 0.85 * self._speech_amp + 0.15 * scaled
         except Exception as e:
             log.error("notify_audio failed: %s", e)
 
@@ -161,24 +170,28 @@ class RobotController:
         emphasis_decay = 0.0
 
         while not self._stop_idle.is_set():
-            state = self._anim_state
-
-            # Expression has full control — just sleep
-            if state == "expression":
+            # Expression has full control — just sleep.
+            if self._expression_active.is_set():
                 time.sleep(0.05)
                 continue
 
-            # Speaking timeout → idle after 1.2 s silence (accounts for audio buffer)
-            if state == "speaking" and time.time() - self._last_audio_time > 1.2:
-                self._anim_state = "idle"
-                state = "idle"
-                self._speech_amp = 0.0
+            # Speaking is driven directly by the bound event
+            # (gemini.is_speaking). No timers, no jitter.
+            speaking = (
+                self._speaking_event is not None
+                and self._speaking_event.is_set()
+            )
+            if not speaking:
+                # Bleed amplitude so the next speaking turn starts fresh.
+                self._speech_amp *= 0.85
                 emphasis_decay = 0.0
 
             t = time.time() - t0
 
-            if state == "speaking":
+            if speaking:
                 amp = self._speech_amp
+                # Floor: keep a minimum bob so the animation never looks frozen.
+                amp = max(amp, 0.20)
 
                 # Gentle, calm bob — lower amplitude & slower than before so
                 # speech looks natural, not aggressive.
@@ -255,7 +268,7 @@ class RobotController:
         try:
             from reachy_mini.utils import create_head_pose
 
-            self._anim_state = "expression"
+            self._expression_active.set()
             moves = self._load_emotions()
             move = moves.get(name)
             self.reachy.play_move(move, initial_goto_duration=0.5, sound=True)
@@ -266,10 +279,10 @@ class RobotController:
                 head=create_head_pose(roll=0, pitch=0, yaw=0, degrees=True, mm=True),
                 duration=1.5,
             )
-            self._anim_state = "idle"
+            self._expression_active.clear()
             return True
         except Exception as e:
-            self._anim_state = "idle"
+            self._expression_active.clear()
             log.warning("Expression '%s' failed: %s", name, e)
             return False
 
@@ -285,7 +298,7 @@ class RobotController:
     # ---- head movement -----------------------------------------------------
     def move_head(self, yaw_deg: float, pitch_deg: float, duration: float = 0.3) -> None:
         """Smoothly move the head to a yaw/pitch angle (degrees)."""
-        self._anim_state = "expression"
+        self._expression_active.set()
         self.reachy.goto_target(
             head=head_pose(
                 roll=0.0,
@@ -294,7 +307,7 @@ class RobotController:
             ),
             duration=duration,
         )
-        self._anim_state = "idle"
+        self._expression_active.clear()
         log.info("Head moved to yaw=%.1f pitch=%.1f (dur=%.2fs)", yaw_deg, pitch_deg, duration)
 
     def center_head(self, duration: float = 0.5) -> None:

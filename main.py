@@ -875,6 +875,9 @@ async def main() -> None:
             sys.exit(1)
         log.info("Gemini Live connected.")
 
+        # Drive the speaking animation from Gemini's turn boundaries.
+        robot.bind_speaking_event(gemini.is_speaking)
+
         # --- Main loop ------------------------------------------------------
         stop_event = asyncio.Event()
 
