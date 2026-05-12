@@ -38,15 +38,14 @@ log = logging.getLogger("face_module")
 # Tunables
 # ---------------------------------------------------------------------------
 HIGH_THRESHOLD = 0.48       # confident named match (typical ArcFace ~0.45-0.50)
-LOW_THRESHOLD = 0.32        # below this we don't even hint a candidate
-MARGIN = 0.04               # min top1-top2 gap for confident match
+LOW_THRESHOLD = 0.28        # below this we don't even hint a candidate
 MAX_GALLERY = 50            # max embeddings stored per name
 DUP_THRESHOLD = 0.96        # skip enrollment of near-duplicate embeddings
 DETECT_HZ = 8               # face detection cadence
 DET_SIZE = 640              # SCRFD input size (was 320; bigger = better for small/distant faces)
 FOLLOW_HZ = 15              # head-control cadence while following
 UNKNOWN_NEW_SECS = 3.0      # stable unknown duration before emitting an event
-UNCERTAIN_DEBOUNCE = 8.0    # min seconds between uncertain events for one candidate
+UNCERTAIN_DEBOUNCE = 120.0  # min seconds between uncertain events for one candidate
 
 EVENT_NEW_UNKNOWN = "face.new_unknown"
 EVENT_IDENTITY_UNCERTAIN = "face.identity_uncertain"

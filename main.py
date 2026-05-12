@@ -45,6 +45,7 @@ from hsafa_voice_vision import Camera, RobotController
 from hsafa_sdk import HsafaSDK, SdkOptions
 from hsafa_robot.scheduler_skill import SchedulerSkill
 from hsafa_face_module import FaceModule
+from hsafa_iot import IoTClient
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -128,9 +129,14 @@ def build_gemini_system_prompt(memory_snapshot: str = "") -> str:
         "  When the schedule fires, Haseef receives a schedule.triggered event.\n"
         "- list_schedules(): List all active schedules.\n"
         "- cancel_schedule(schedule_id): Cancel an active schedule.\n"
+        "- IoT / door & lights: Haseef can control the door servo, 4 door LEDs,\n"
+        "  a main RGB light, and auto-dark mode via an ESP32.\n"
+        "  iot_led(n, state), iot_rgb_color(color), iot_rgb(r,g,b),\n"
+        "  iot_door(state), iot_auto(enabled?, threshold?), iot_status().\n"
 
         "=== WHEN TO USE queue_thinker_task ===\n"
         "- User asks for PHYSICAL action (move head, look around, etc.)\n"
+        "- User asks to control door, lights, LEDs, or auto-dark mode\n"
         "- User asks about memories, people, schedules\n"
         "- User asks for deep reasoning you cannot answer directly\n\n"
 
@@ -285,6 +291,7 @@ class UnifiedBridge:
         main_loop: Optional[asyncio.AbstractEventLoop] = None,
         scheduler: Optional[SchedulerSkill] = None,
         face: Optional[FaceModule] = None,
+        iot_client: Optional[IoTClient] = None,
     ) -> None:
         self.gemini = gemini
         self.haseef_sdk = haseef_sdk
@@ -296,6 +303,8 @@ class UnifiedBridge:
         self._pending_says: list[str] = []
         self.scheduler = scheduler
         self.face = face
+        self.iot = iot_client
+        self._last_task_ts: float = 0.0
 
     # --- Haseef setup -------------------------------------------------------
     async def setup_haseef(self) -> None:
@@ -429,6 +438,58 @@ class UnifiedBridge:
                 "description": "Release the head from face-following back to idle behavior.",
                 "input": {},
             },
+            # --- IoT (door & lights) ---------------------------------------
+            {
+                "name": "iot_status",
+                "description": (
+                    "Read the current state of the door/LED controller. "
+                    "Returns LED states, RGB color, light level, servo angle, "
+                    "and auto-dark mode status."
+                ),
+                "input": {},
+            },
+            {
+                "name": "iot_led",
+                "description": (
+                    "Turn on, off, or toggle one of the 4 door LEDs. "
+                    "n = 1,2,3,4. state = 'on', 'off', or 'toggle'."
+                ),
+                "input": {"n": "number", "state": "string"},
+            },
+            {
+                "name": "iot_rgb_color",
+                "description": (
+                    "Set the main RGB LED to a named color. "
+                    "Valid: red, green, blue, yellow, cyan, magenta, white, off."
+                ),
+                "input": {"color": "string"},
+            },
+            {
+                "name": "iot_rgb",
+                "description": (
+                    "Set the main RGB LED to a custom color. "
+                    "r, g, b each 0-255. Example: iot_rgb(r=255, g=128, b=0) for orange."
+                ),
+                "input": {"r": "number", "g": "number", "b": "number"},
+            },
+            {
+                "name": "iot_door",
+                "description": (
+                    "Open or close the door using the servo motor. "
+                    "state = 'open' or 'close'."
+                ),
+                "input": {"state": "string"},
+            },
+            {
+                "name": "iot_auto",
+                "description": (
+                    "Control the automatic dark-mode LEDs. "
+                    "enabled: true/false. threshold: 0-4095 light level below which LEDs turn on. "
+                    "Call iot_auto(enabled=true) to resume auto mode after manual LED changes."
+                ),
+                "input": {"enabled": "boolean?", "threshold": "number?"},
+            },
+            # ----------------------------------------------------------------
             {
                 "name": "show_expression",
                 "description": (
@@ -450,7 +511,8 @@ class UnifiedBridge:
             "[Haseef] Registered tools: create_schedule, list_schedules, "
             "cancel_schedule, look_around, set_head_pose, say_this, "
             "capture_image, show_expression, enroll_face, forget_face, "
-            "list_known_faces, who_is_visible, follow_face, stop_following."
+            "list_known_faces, who_is_visible, follow_face, stop_following, "
+            "iot_status, iot_led, iot_rgb_color, iot_rgb, iot_door, iot_auto."
         )
 
         # Tool handlers
@@ -468,6 +530,13 @@ class UnifiedBridge:
         self.haseef_sdk.on_tool_call("who_is_visible", self._handle_who_is_visible)
         self.haseef_sdk.on_tool_call("follow_face", self._handle_follow_face)
         self.haseef_sdk.on_tool_call("stop_following", self._handle_stop_following)
+        # IoT handlers
+        self.haseef_sdk.on_tool_call("iot_status", self._handle_iot_status)
+        self.haseef_sdk.on_tool_call("iot_led", self._handle_iot_led)
+        self.haseef_sdk.on_tool_call("iot_rgb_color", self._handle_iot_rgb_color)
+        self.haseef_sdk.on_tool_call("iot_rgb", self._handle_iot_rgb)
+        self.haseef_sdk.on_tool_call("iot_door", self._handle_iot_door)
+        self.haseef_sdk.on_tool_call("iot_auto", self._handle_iot_auto)
         # Lifecycle events
         self.haseef_sdk.on("run.started", lambda e: log.info("[Haseef] run started"))
         self.haseef_sdk.on("run.completed", lambda e: log.info("[Haseef] run completed"))
@@ -742,6 +811,64 @@ class UnifiedBridge:
         log.info("[Haseef tool] stop_following")
         return self.face.stop_following()
 
+    # --- IoT handlers -------------------------------------------------------
+    async def _handle_iot_status(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.iot is None:
+            return {"ok": False, "error": "IoT module not available"}
+        log.info("[Haseef tool] iot_status")
+        return await asyncio.to_thread(self.iot.status)
+
+    async def _handle_iot_led(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.iot is None:
+            return {"ok": False, "error": "IoT module not available"}
+        n = int(args.get("n", 0))
+        state = args.get("state", "")
+        log.info("[Haseef tool] iot_led: n=%d state=%s", n, state)
+        return await asyncio.to_thread(self.iot.led, n, state)
+
+    async def _handle_iot_rgb_color(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.iot is None:
+            return {"ok": False, "error": "IoT module not available"}
+        color = args.get("color", "")
+        log.info("[Haseef tool] iot_rgb_color: %s", color)
+        return await asyncio.to_thread(self.iot.rgb_color, color)
+
+    async def _handle_iot_rgb(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.iot is None:
+            return {"ok": False, "error": "IoT module not available"}
+        r = int(args.get("r", 0))
+        g = int(args.get("g", 0))
+        b = int(args.get("b", 0))
+        log.info("[Haseef tool] iot_rgb: r=%d g=%d b=%d", r, g, b)
+        return await asyncio.to_thread(self.iot.rgb, r, g, b)
+
+    async def _handle_iot_door(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.iot is None:
+            return {"ok": False, "error": "IoT module not available"}
+        state = args.get("state", "")
+        log.info("[Haseef tool] iot_door: %s", state)
+        return await asyncio.to_thread(self.iot.door, state)
+
+    async def _handle_iot_auto(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.iot is None:
+            return {"ok": False, "error": "IoT module not available"}
+        enabled = args.get("enabled")
+        threshold = args.get("threshold")
+        log.info("[Haseef tool] iot_auto: enabled=%s threshold=%s", enabled, threshold)
+        return await asyncio.to_thread(self.iot.auto, enabled, threshold)
+
     # --- Gemini tool handler ------------------------------------------------
     async def _run_sdk_on_main(self, coro):
         """Run an SDK coroutine on the main event loop from Gemini's thread."""
@@ -781,6 +908,7 @@ class UnifiedBridge:
         task = args.get("task", "")
         what_i_told_user = args.get("what_i_told_user", "")
         log.info("[Gemini->Haseef] queue_thinker_task: %s", task[:100])
+        self._last_task_ts = time.time()
         asyncio.create_task(self._push_thinker_task(task, what_i_told_user))
         return {"status": "queued", "reminder": "speak to the user now"}
 
@@ -1027,6 +1155,9 @@ async def main() -> None:
         if "robot_base" not in skills:
             log.info("Attaching 'robot_base' skill to Haseef...")
             await haseef_sdk.haseef.add_skill(haseef_id, "robot_base")
+        if "iot" not in skills:
+            log.info("Attaching 'iot' skill to Haseef...")
+            await haseef_sdk.haseef.add_skill(haseef_id, "iot")
         log.info(
             "Haseef '%s' ready (skills: %s).",
             h.get("name", "?"), skills,
@@ -1057,10 +1188,19 @@ async def main() -> None:
     log.info("Scheduler ready.")
 
     # --- Bridge -------------------------------------------------------------
+    from hsafa_iot import IoTClient
+    try:
+        iot_client = IoTClient()
+        log.info("IoT client ready (%s)", iot_client.base_url)
+    except Exception as e:
+        log.warning("IoT client unavailable: %s", e)
+        iot_client = None
+
     bridge = UnifiedBridge(
         None, haseef_sdk, robot, camera, haseef_id,
         main_loop=main_loop,
         scheduler=scheduler,
+        iot_client=iot_client,
     )
     await bridge.setup_haseef()
 
@@ -1155,9 +1295,13 @@ async def main() -> None:
             """Bridge face-module events into Haseef as image-attached messages.
 
             Runs in the face-detect thread; we hop back to main_loop to call
-            the SDK.
+            the SDK.  Suppress proactive face events for 10 s after a thinker
+            task so Haseef isn't distracted while handling a user request.
             """
             if not jpeg_bytes:
+                return
+            if time.time() - bridge._last_task_ts < 10.0:
+                log.debug("[face-event] suppressed (%s) — task in flight", name)
                 return
             jpeg_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
             note = f"[{name}] {data.get('note', '')}".strip()
