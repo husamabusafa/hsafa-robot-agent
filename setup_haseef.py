@@ -2,7 +2,7 @@
 """setup_haseef.py — Create or update the Haseef on Hsafa Core.
 
 Run once before starting the robot:
-    python main_hsafa_robot/setup_haseef.py
+    python setup_haseef.py
 
 This creates the Haseef entity on the Hsafa Core server, attaches the
 `robot_base` skill, and sets the system prompt + LLM config.
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import httpx
 
-_repo_root = Path(__file__).parent.parent
+_repo_root = Path(__file__).parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
@@ -250,7 +250,7 @@ async def main() -> None:
         print(f"[WARN] Verification failed: {e}")
 
     await sdk.disconnect()
-    print("\n[SETUP] Done. You can now run: python main_hsafa_robot/main.py")
+    print("\n[SETUP] Done. You can now run: python main.py")
 
 
 if __name__ == "__main__":

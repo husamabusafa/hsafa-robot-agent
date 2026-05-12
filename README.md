@@ -1,4 +1,46 @@
-# hsafa-robot — Reachy Mini starter
+# hsafa-robot
+
+Voice + vision + body brain for the Reachy Mini, powered by Gemini Live and
+Haseef (Hsafa Core).
+
+## Project layout
+
+```
+.
+├── main.py              # The one entry point: Gemini Live + Haseef brain + robot
+├── setup_haseef.py      # One-shot: create/update the Haseef entity on Hsafa Core
+├── hsafa_robot/         # Robot package (gemini_live, camera, controller, scheduler, ...)
+├── hsafa_voice_vision.py# Camera + RobotController helpers
+├── requirements.txt
+├── scripts/
+│   └── daemon.sh        # start/stop the Reachy Mini daemon (motors + media)
+├── docs/                # Design & architecture notes
+├── archive/             # Old experiments and legacy scripts (not used at runtime)
+└── .venv/               # Python virtualenv with reachy-mini installed
+```
+
+## Quick start
+
+```bash
+# 1. Activate the venv (already created)
+source .venv/bin/activate
+
+# 2. (Once) Create the Haseef entity on Hsafa Core
+python setup_haseef.py
+
+# 3. Start the Reachy Mini daemon (motors + media on :8000)
+./scripts/daemon.sh start
+
+# 4. Start the brain (Gemini Live + Haseef + robot controller)
+python main.py
+```
+
+Env vars expected in `.env` (see `.env.example`):
+`GEMINI_API_KEY`, `HSAFA_CORE_URL`, `HSAFA_CORE_KEY`, `HASEEF_ID`.
+
+---
+
+# Reachy Mini hardware notes
 
 Getting started with a **Reachy Mini (wired / USB-C version)** from macOS.
 

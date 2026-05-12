@@ -7,7 +7,6 @@ Exports:
 from __future__ import annotations
 
 import base64
-import collections
 import logging
 import math
 import threading
@@ -149,20 +148,17 @@ class RobotController:
         from reachy_mini.utils import create_head_pose
 
         t0 = time.time()
+
+        # Idle drift state: smoothly interpolate toward a target yaw that
+        # changes every few seconds. No pitch breathing.
         next_drift = 0.0
-        pitch_off = 0.0
         yaw_off = 0.0
+        target_yaw = 0.0
 
         # Speaking emphasis state
         next_emphasis = 0.0
         emphasis_yaw = 0.0
         emphasis_decay = 0.0
-
-        # Sound direction tracking (disabled)
-        # self._doa_history = collections.deque(maxlen=5)
-        # self._doa_yaw_target = 0.0
-        self._doa_yaw_current = 0.0
-        # self._last_doa_poll = 0.0
 
         while not self._stop_idle.is_set():
             state = self._anim_state
@@ -172,60 +168,35 @@ class RobotController:
                 time.sleep(0.05)
                 continue
 
-            # Speaking timeout → idle after 1.5 s silence (accounts for audio buffer)
-            if state == "speaking" and time.time() - self._last_audio_time > 1.5:
+            # Speaking timeout → idle after 1.2 s silence (accounts for audio buffer)
+            if state == "speaking" and time.time() - self._last_audio_time > 1.2:
                 self._anim_state = "idle"
                 state = "idle"
                 self._speech_amp = 0.0
                 emphasis_decay = 0.0
-
-            # Poll sound direction at ~10 Hz (disabled)
-            # now = time.time()
-            # if now - self._last_doa_poll > 0.1:
-            #     self._last_doa_poll = now
-            #     try:
-            #         doa, is_speech = self.reachy.media.get_DoA()
-            #         if is_speech:
-            #             self._doa_history.append(doa)
-            #             n = len(self._doa_history)
-            #             sin_mean = sum(math.sin(a) for a in self._doa_history) / n
-            #             cos_mean = sum(math.cos(a) for a in self._doa_history) / n
-            #             smoothed = math.atan2(sin_mean, cos_mean)
-            #             # Deadzone around front/back ambiguity (π/2 ± 0.2 rad)
-            #             if abs(smoothed - math.pi / 2) < 0.2:
-            #                 self._doa_yaw_target = 0.0
-            #             else:
-            #                 self._doa_yaw_target = 60.0 - (smoothed / math.pi) * 120.0
-            #         else:
-            #             self._doa_history.clear()
-            #             self._doa_yaw_target = 0.0
-            #     except Exception:
-            #         pass
-
-            # Smooth toward target (or back to zero when speech stops) (disabled)
-            # self._doa_yaw_current += (self._doa_yaw_target - self._doa_yaw_current) * 0.15
 
             t = time.time() - t0
 
             if state == "speaking":
                 amp = self._speech_amp
 
-                # 1. Audio-reactive bob (z + pitch at 5.5 Hz)
-                phase = 2 * math.pi * t * 5.5
-                bob_z = amp * 6.0 * math.sin(phase)
-                bob_pitch = amp * 6.0 * math.sin(phase)
+                # Gentle, calm bob — lower amplitude & slower than before so
+                # speech looks natural, not aggressive.
+                phase = 2 * math.pi * t * 2.8
+                bob_z = amp * 2.5 * math.sin(phase)
+                bob_pitch = amp * 1.8 * math.sin(phase + 0.4)
 
-                # 2. Slow ambient drift
-                drift_yaw = 3.0 * math.sin(2 * math.pi * t / 6.1)
-                drift_roll = 1.5 * math.sin(2 * math.pi * t / 8.7)
+                # Slow ambient drift gives life without jitter.
+                drift_yaw = 1.5 * math.sin(2 * math.pi * t / 7.0)
+                drift_roll = 0.8 * math.sin(2 * math.pi * t / 9.0)
 
-                # 3. Occasional emphasis tilts
-                if t > next_emphasis and amp > 0.1:
-                    emphasis_yaw = random.uniform(-10.0, 10.0)
+                # Occasional small emphasis tilt
+                if t > next_emphasis and amp > 0.15:
+                    emphasis_yaw = random.uniform(-4.0, 4.0)
                     emphasis_decay = 1.0
-                    next_emphasis = t + random.uniform(2.0, 5.0)
+                    next_emphasis = t + random.uniform(3.5, 7.0)
                 if emphasis_decay > 0.01:
-                    emphasis_decay *= 0.95  # fade ~1 s
+                    emphasis_decay *= 0.96  # fade ~1.5 s
 
                 pose = create_head_pose(
                     z=bob_z,
@@ -235,27 +206,37 @@ class RobotController:
                     degrees=True,
                     mm=True,
                 )
+                self.reachy.set_target_head_pose(pose)
+
+                # Talking antennas: speech-rhythm sway, amplitude follows
+                # audio level so quiet speech = small movement, loud = bigger.
+                ant_amp = 0.10 + 0.35 * amp  # radians
+                ant_phase = 2 * math.pi * t * 2.2
+                ant_r = ant_amp * math.sin(ant_phase)
+                ant_l = ant_amp * math.sin(ant_phase + math.pi * 0.7)
+                self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
             else:
-                # Idle: subtle roll sway + micro-glances
-                roll = 1.5 * math.sin(2 * math.pi * t / 7.3)
+                # Idle: smooth slow yaw glances + tiny roll. No pitch breathing.
                 if t > next_drift:
-                    pitch_off = random.uniform(-3.0, 3.0)
-                    yaw_off = random.uniform(-5.0, 5.0)
-                    next_drift = t + random.uniform(3.0, 8.0)
+                    target_yaw = random.uniform(-2.5, 2.5)
+                    next_drift = t + random.uniform(5.0, 9.0)
+                # Smooth lerp at ~50 Hz toward target (very gradual)
+                yaw_off += (target_yaw - yaw_off) * 0.015
+                roll = 0.7 * math.sin(2 * math.pi * t / 9.0)
 
                 pose = create_head_pose(
                     roll=roll,
-                    pitch=pitch_off,
+                    pitch=0.0,
                     yaw=yaw_off,
                     degrees=True,
                     mm=True,
                 )
-            self.reachy.set_target_head_pose(pose)
+                self.reachy.set_target_head_pose(pose)
 
-            # Antennas always sway (same for idle & speaking)
-            ant_r = 0.3 * math.sin(2 * math.pi * t / 5.7)
-            ant_l = 0.3 * math.sin(2 * math.pi * t / 6.3 + 1.0)
-            self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
+                # Idle antennas: soft, calm breath
+                ant_r = 0.12 * math.sin(2 * math.pi * t / 6.5)
+                ant_l = 0.12 * math.sin(2 * math.pi * t / 7.1 + 0.8)
+                self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
 
             time.sleep(0.02)  # ~50 Hz
 
