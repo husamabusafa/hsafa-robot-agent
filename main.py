@@ -44,6 +44,7 @@ from hsafa_robot.gemini_live import GeminiLiveSession
 from hsafa_voice_vision import Camera, RobotController
 from hsafa_sdk import HsafaSDK, SdkOptions
 from hsafa_robot.scheduler_skill import SchedulerSkill
+from hsafa_face_module import FaceModule
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -147,7 +148,21 @@ def build_gemini_system_prompt(memory_snapshot: str = "") -> str:
         "3. You and Haseef are one mind. Speak Haseef's messages naturally.\n"
         "4. Be warm, concise, and conversational.\n"
         "5. You ARE the eyes — answer visual questions directly from the camera.\n"
-        "6. Only send tasks to Haseef for physical movement, complex memory, or questions you cannot answer directly.\n"
+        "6. Only send tasks to Haseef for physical movement, complex memory, or questions you cannot answer directly.\n\n"
+
+        "=== READING FACES IN THE CAMERA (anti-mistake rule) ===\n"
+        "The robot draws a colored box around each face it sees, with a label:\n"
+        "- GREEN box with a NAME = a confidently recognized known person.\n"
+        "  The name on the box is AUTHORITATIVE. Use exactly that name.\n"
+        "- AMBER box 'unknown (maybe X?)' = the robot is NOT sure. NEVER greet\n"
+        "  by that name; instead queue a thinker task so Haseef can ask the\n"
+        "  user politely to confirm.\n"
+        "- YELLOW 'unknown' box = a stranger. If the user introduces them by\n"
+        "  name (\"this is Sara\") or says 'remember me as Husam', queue a\n"
+        "  thinker task with that exact phrasing so Haseef can call enroll_face.\n"
+        "NEVER invent a name, NEVER say 'I think this is X' unless the green\n"
+        "box says X. If no box at all is drawn, the face module is still\n"
+        "warming up — describe the person by appearance, not by name.\n"
         + snapshot_block
     )
 
@@ -269,6 +284,7 @@ class UnifiedBridge:
         haseef_id: str,
         main_loop: Optional[asyncio.AbstractEventLoop] = None,
         scheduler: Optional[SchedulerSkill] = None,
+        face: Optional[FaceModule] = None,
     ) -> None:
         self.gemini = gemini
         self.haseef_sdk = haseef_sdk
@@ -279,6 +295,7 @@ class UnifiedBridge:
         self._say_lock = asyncio.Lock()
         self._pending_says: list[str] = []
         self.scheduler = scheduler
+        self.face = face
 
     # --- Haseef setup -------------------------------------------------------
     async def setup_haseef(self) -> None:
@@ -361,6 +378,58 @@ class UnifiedBridge:
                 "input": {"quality": "integer?"},
             },
             {
+                "name": "enroll_face",
+                "description": (
+                    "Remember the face that is currently in front of the robot "
+                    "under the given name. Captures several embeddings from the "
+                    "largest face in view. ONLY call this AFTER the user has "
+                    "verbally confirmed the name (e.g. they said 'I am Husam' "
+                    "or replied yes to 'Are you Sara?'). Never guess names."
+                ),
+                "input": {"name": "string"},
+            },
+            {
+                "name": "forget_face",
+                "description": (
+                    "Delete a person's face from the robot's local gallery. "
+                    "Used when the user asks to be forgotten or to clean up."
+                ),
+                "input": {"name": "string"},
+            },
+            {
+                "name": "list_known_faces",
+                "description": (
+                    "List names of all people the robot can recognize, with "
+                    "how many embeddings are stored for each."
+                ),
+                "input": {},
+            },
+            {
+                "name": "who_is_visible",
+                "description": (
+                    "Return the people currently visible in the camera, with "
+                    "their recognized names (or 'unknown'), confidence, and "
+                    "position (left/center/right). Also pushes a labelled "
+                    "camera image so you can see what the robot sees."
+                ),
+                "input": {},
+            },
+            {
+                "name": "follow_face",
+                "description": (
+                    "Lock the robot's head onto a face so it stays centered "
+                    "as the person moves. If 'name' is provided, follow that "
+                    "specific named person; otherwise follow the largest face "
+                    "in view (typical for 'follow me' requests)."
+                ),
+                "input": {"name": "string?"},
+            },
+            {
+                "name": "stop_following",
+                "description": "Release the head from face-following back to idle behavior.",
+                "input": {},
+            },
+            {
                 "name": "show_expression",
                 "description": (
                     "Show an animated emotion clip with head motion and sound. "
@@ -377,7 +446,12 @@ class UnifiedBridge:
                 },
             },
         ])
-        log.info("[Haseef] Registered 8 tools: create_schedule, list_schedules, cancel_schedule, look_around, set_head_pose, say_this, capture_image, show_expression.")
+        log.info(
+            "[Haseef] Registered tools: create_schedule, list_schedules, "
+            "cancel_schedule, look_around, set_head_pose, say_this, "
+            "capture_image, show_expression, enroll_face, forget_face, "
+            "list_known_faces, who_is_visible, follow_face, stop_following."
+        )
 
         # Tool handlers
         self.haseef_sdk.on_tool_call("create_schedule", self._handle_create_schedule)
@@ -388,6 +462,12 @@ class UnifiedBridge:
         self.haseef_sdk.on_tool_call("say_this", self._handle_say_this)
         self.haseef_sdk.on_tool_call("capture_image", self._handle_capture_image)
         self.haseef_sdk.on_tool_call("show_expression", self._handle_show_expression)
+        self.haseef_sdk.on_tool_call("enroll_face", self._handle_enroll_face)
+        self.haseef_sdk.on_tool_call("forget_face", self._handle_forget_face)
+        self.haseef_sdk.on_tool_call("list_known_faces", self._handle_list_known_faces)
+        self.haseef_sdk.on_tool_call("who_is_visible", self._handle_who_is_visible)
+        self.haseef_sdk.on_tool_call("follow_face", self._handle_follow_face)
+        self.haseef_sdk.on_tool_call("stop_following", self._handle_stop_following)
         # Lifecycle events
         self.haseef_sdk.on("run.started", lambda e: log.info("[Haseef] run started"))
         self.haseef_sdk.on("run.completed", lambda e: log.info("[Haseef] run completed"))
@@ -519,11 +599,15 @@ class UnifiedBridge:
         await asyncio.to_thread(self.robot.move_head, yaw, pitch, 0.3)
         await asyncio.sleep(0.5)
 
-        jpeg_b64 = self.camera.get_base64_jpeg() if self.camera else None
+        jpeg_b64 = None
+        if self.face is not None:
+            jpeg_b64 = self.face.get_annotated_b64_jpeg()
+        if jpeg_b64 is None and self.camera is not None:
+            jpeg_b64 = self.camera.get_base64_jpeg()
         if jpeg_b64:
             await self._push_image_event(
                 jpeg_b64,
-                note=f"Head moved to yaw={yaw}, pitch={pitch}. Here is what I see.",
+                note=f"Head moved to yaw={yaw}, pitch={pitch}. Here is what I see (faces are labelled).",
             )
         return {
             "ok": True,
@@ -578,19 +662,85 @@ class UnifiedBridge:
     async def _handle_capture_image(
         self, args: Dict[str, Any], ctx: Dict[str, Any]
     ) -> Dict[str, Any]:
-        if self.camera is None:
-            log.warning("[Haseef tool] capture_image: camera not ready")
+        jpeg_b64 = None
+        if self.face is not None:
+            jpeg_b64 = self.face.get_annotated_b64_jpeg()
+        if jpeg_b64 is None and self.camera is not None:
+            jpeg_b64 = self.camera.get_base64_jpeg()
+        if jpeg_b64 is None:
+            log.warning("[Haseef tool] capture_image: no frame available")
             return {"ok": False, "error": "camera not ready"}
-        jpeg_b64 = self.camera.get_base64_jpeg()
+        log.info("[Haseef tool] capture_image: %d KB", len(jpeg_b64) // 1024)
+        await self._push_image_event(
+            jpeg_b64,
+            note="Here is what I see right now (faces are labelled).",
+        )
+        return {"ok": True, "image_base64": jpeg_b64}
+
+    # --- Face module handlers --------------------------------------------
+    async def _handle_enroll_face(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        name = (args.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "name is required"}
+        if self.face is None:
+            return {"ok": False, "error": "face module not available"}
+        log.info("[Haseef tool] enroll_face: %s", name)
+        result = await asyncio.to_thread(self.face.enroll, name)
+        return result
+
+    async def _handle_forget_face(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        name = (args.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "error": "name is required"}
+        if self.face is None:
+            return {"ok": False, "error": "face module not available"}
+        log.info("[Haseef tool] forget_face: %s", name)
+        return self.face.forget(name)
+
+    async def _handle_list_known_faces(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.face is None:
+            return {"ok": False, "error": "face module not available"}
+        return {"ok": True, "faces": self.face.list_known()}
+
+    async def _handle_who_is_visible(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.face is None:
+            return {"ok": False, "error": "face module not available"}
+        visible = self.face.describe_visible()
+        jpeg_b64 = self.face.get_annotated_b64_jpeg()
         if jpeg_b64:
-            log.info("[Haseef tool] capture_image: %d KB", len(jpeg_b64) // 1024)
             await self._push_image_event(
                 jpeg_b64,
-                note="Here is what I see right now.",
+                note=(
+                    "Here is who I currently see (faces labelled). "
+                    "Use the box labels as the source of truth for names."
+                ),
             )
-        else:
-            log.warning("[Haseef tool] capture_image failed")
-        return {"ok": jpeg_b64 is not None, "image_base64": jpeg_b64}
+        return {"ok": True, "visible": visible, "count": len(visible)}
+
+    async def _handle_follow_face(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.face is None:
+            return {"ok": False, "error": "face module not available"}
+        name = args.get("name")
+        log.info("[Haseef tool] follow_face: %s", name or "(dominant)")
+        return self.face.follow(name)
+
+    async def _handle_stop_following(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.face is None:
+            return {"ok": False, "error": "face module not available"}
+        log.info("[Haseef tool] stop_following")
+        return self.face.stop_following()
 
     # --- Gemini tool handler ------------------------------------------------
     async def _run_sdk_on_main(self, coro):
@@ -997,11 +1147,48 @@ async def main() -> None:
         capture_thread.start()
         log.info("Camera capture thread started.")
 
+        # --- Face module ----------------------------------------------------
+        def _latest_frame_getter() -> Optional[np.ndarray]:
+            return latest_frame
+
+        def _on_face_event(name: str, data: Dict[str, Any], jpeg_bytes: Optional[bytes]) -> None:
+            """Bridge face-module events into Haseef as image-attached messages.
+
+            Runs in the face-detect thread; we hop back to main_loop to call
+            the SDK.
+            """
+            if not jpeg_bytes:
+                return
+            jpeg_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+            note = f"[{name}] {data.get('note', '')}".strip()
+            try:
+                if main_loop and not main_loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(
+                        bridge._push_image_event(jpeg_b64, note=note),
+                        main_loop,
+                    )
+            except Exception as e:
+                log.warning("[face-event] dispatch failed: %s", e)
+
+        face_module = FaceModule(on_event=_on_face_event)
+        try:
+            face_module.start(_latest_frame_getter, robot)
+            bridge.face = face_module
+            log.info("Face module started.")
+        except Exception as e:
+            log.error("Face module failed to start: %s", e)
+            face_module = None
+
         def frame_source() -> Optional[bytes]:
-            """Return the latest camera frame as JPEG bytes for Gemini Live."""
+            """Return the latest camera frame (with face labels) for Gemini Live."""
             frame = latest_frame
             if frame is None:
                 return None
+            if face_module is not None:
+                try:
+                    frame = face_module.annotate_frame(frame.copy())
+                except Exception as e:
+                    log.debug("annotate failed: %s", e)
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
             return buf.tobytes() if ok else None
 
@@ -1098,6 +1285,9 @@ async def main() -> None:
 
         _cap_running.clear()
         capture_thread.join(timeout=1.0)
+
+        if face_module is not None:
+            face_module.stop()
 
         if robot:
             robot.stop_idle()

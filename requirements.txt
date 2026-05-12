@@ -7,3 +7,7 @@ google-genai>=1.70
 python-dotenv>=1.0
 silero-vad>=5.0
 croniter>=6.0
+
+# Face recognition (InsightFace ArcFace, ONNX, CPU)
+insightface>=0.7
+onnxruntime>=1.17
