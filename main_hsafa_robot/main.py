@@ -44,7 +44,6 @@ from hsafa_robot.gemini_live import GeminiLiveSession
 from hsafa_voice_vision import Camera, RobotController
 from hsafa_sdk import HsafaSDK, SdkOptions
 from main_hsafa_robot.scheduler_skill import SchedulerSkill
-from hsafa_robot.ksu_knowledge import query_ksu_knowledge, search_ksu_faculty
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -109,23 +108,10 @@ def build_gemini_system_prompt() -> str:
         "  When the schedule fires, Haseef receives a schedule.triggered event.\n"
         "- list_schedules(): List all active schedules.\n"
         "- cancel_schedule(schedule_id): Cancel an active schedule.\n"
-        "- query_ksu_knowledge(question): Haseef's EXPERT tool for King Saud University documents.\n"
-        "  Haseef has official KSU documents (student guides, regulations, orientation\n"
-        "  programs, FAQs) and searches them to answer questions. Use this for ANY\n"
-        "  question about KSU: academic systems, student services, programs, rules,\n"
-        "  or university information — in Arabic or English.\n"
-        "- search_ksu_faculty(query): Haseef's EXPERT tool for KSU faculty/professors.\n"
-        "  Searches a database of 7,000+ faculty members by name, degree, job title,\n"
-        "  or email. Returns name, email, phone, profile URL, and academic degree.\n"
-        "  Use this when the user asks about ANY professor, doctor, or faculty member.\n\n"
 
         "=== WHEN TO USE queue_thinker_task ===\n"
         "- User asks for PHYSICAL action (move head, look around, etc.)\n"
         "- User asks about memories, people, schedules\n"
-        "- User asks about King Saud University, student systems, academic rules,\n"
-        "  orientation programs, or any university topic — Haseef has official documents.\n"
-        "- User asks about ANY professor, doctor, faculty member, or wants to find\n"
-        "  contact info (email, phone) for someone at KSU — Haseef has 7,000+ faculty records.\n"
         "- User asks for deep reasoning you cannot answer directly\n\n"
 
         "=== WHEN NOT TO USE queue_thinker_task ===\n"
@@ -142,10 +128,7 @@ def build_gemini_system_prompt() -> str:
         "3. You and Haseef are one mind. Speak Haseef's messages naturally.\n"
         "4. Be warm, concise, and conversational.\n"
         "5. You ARE the eyes — answer visual questions directly from the camera.\n"
-        "6. If the user asks ANYTHING about King Saud University (systems, programs,\n"
-        "   rules, student services, orientation, registration, etc.), ALWAYS send it\n"
-        "   to Haseef via queue_thinker_task. Haseef has official documents.\n"
-        "7. Only send tasks to Haseef for physical movement, complex memory, or KSU questions.\n"
+        "6. Only send tasks to Haseef for physical movement, complex memory, or questions you cannot answer directly.\n"
     )
 
 
@@ -351,35 +334,8 @@ class UnifiedBridge:
                     "emotion": "string",
                 },
             },
-            {
-                "name": "query_ksu_knowledge",
-                "description": (
-                    "Answer questions about King Saud University using official university documents. "
-                    "The robot has access to student guides, regulations, orientation program guides, "
-                    "and FAQ documents. Use this for ANY question about KSU systems, programs, "
-                    "academic rules, student services, or university information. "
-                    "Ask the question in the user's original language (Arabic or English)."
-                ),
-                "input": {
-                    "question": "string",
-                },
-            },
-            {
-                "name": "search_ksu_faculty",
-                "description": (
-                    "Search the KSU faculty database of 7,000+ professors and staff. "
-                    "Find faculty members by name (Arabic or English), academic degree, "
-                    "job title, or email. Returns name, email, phone, profile URL, and degree. "
-                    "Use this whenever the user asks about a specific professor, doctor, "
-                    "faculty member, or wants to find contact info for someone at KSU."
-                ),
-                "input": {
-                    "query": "string",
-                    "limit": "integer?",
-                },
-            },
         ])
-        log.info("[Haseef] Registered 10 tools: create_schedule, list_schedules, cancel_schedule, look_around, set_head_pose, say_this, capture_image, show_expression, query_ksu_knowledge, search_ksu_faculty.")
+        log.info("[Haseef] Registered 8 tools: create_schedule, list_schedules, cancel_schedule, look_around, set_head_pose, say_this, capture_image, show_expression.")
 
         # Tool handlers
         self.haseef_sdk.on_tool_call("create_schedule", self._handle_create_schedule)
@@ -390,9 +346,6 @@ class UnifiedBridge:
         self.haseef_sdk.on_tool_call("say_this", self._handle_say_this)
         self.haseef_sdk.on_tool_call("capture_image", self._handle_capture_image)
         self.haseef_sdk.on_tool_call("show_expression", self._handle_show_expression)
-        self.haseef_sdk.on_tool_call("query_ksu_knowledge", self._handle_query_ksu_knowledge)
-        self.haseef_sdk.on_tool_call("search_ksu_faculty", self._handle_search_ksu_faculty)
-
         # Lifecycle events
         self.haseef_sdk.on("run.started", lambda e: log.info("[Haseef] run started"))
         self.haseef_sdk.on("run.completed", lambda e: log.info("[Haseef] run completed: %s", e))
@@ -514,87 +467,6 @@ class UnifiedBridge:
         await asyncio.to_thread(self.robot.show_expression, name)
         log.info("[Haseef tool] show_expression: %s", name)
         return {"ok": True, "emotion": name}
-
-    async def _handle_query_ksu_knowledge(
-        self, args: Dict[str, Any], ctx: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        question = args.get("question", "")
-        log.info("[Haseef tool] query_ksu_knowledge: %s", question[:120])
-        try:
-            result = query_ksu_knowledge(question, top_k=10)
-            if result["found"]:
-                passages = [r["text"] for r in result["results"]]
-                sources = result["sources"]
-                summary = (
-                    "بناءً على الوثائق الرسمية:\n"
-                    + "\n".join(f"• {p}" for p in passages[:5])
-                    + f"\n\nالمصادر: {', '.join(sources[:3])}"
-                )
-            else:
-                summary = result["message"]
-            return {
-                "ok": True,
-                "found": result["found"],
-                "summary": summary,
-                "sources": result.get("sources", []),
-            }
-        except Exception as exc:
-            log.error("[Haseef tool] query_ksu_knowledge failed: %s", exc)
-            return {"ok": False, "error": str(exc), "summary": f"خطأ: {exc}"}
-
-    async def _handle_search_ksu_faculty(
-        self, args: Dict[str, Any], ctx: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        query = args.get("query", "")
-        limit = int(args.get("limit", 5))
-        log.info("[Haseef tool] search_ksu_faculty: %s (limit=%d)", query[:120], limit)
-        try:
-            result = search_ksu_faculty(query, limit=limit)
-            if result["found"]:
-                items = result["results"]
-                if len(items) == 1:
-                    f = items[0]
-                    parts = [f"وجدت: {f['name']}"]
-                    if f.get("academic_degree"):
-                        parts.append(f"الدرجة العلمية: {f['academic_degree']}")
-                    if f.get("email"):
-                        parts.append(f"البريد: {f['email']}")
-                    if f.get("phone"):
-                        parts.append(f"الهاتف: {f['phone']}")
-                    if f.get("profile_url"):
-                        parts.append(f"الملف: {f['profile_url']}")
-                    summary = "\n".join(parts)
-                elif len(items) <= 3:
-                    lines = [f"وجدت {len(items)} نتائج:"]
-                    for i, f in enumerate(items, 1):
-                        line = f"{i}. {f['name']}"
-                        if f.get("email"):
-                            line += f" ({f['email']})"
-                        if f.get("academic_degree"):
-                            line += f" — {f['academic_degree']}"
-                        lines.append(line)
-                    summary = "\n".join(lines)
-                else:
-                    lines = [f"وجدت {len(items)} نتيجة. أبرز التطابقات:"]
-                    for i, f in enumerate(items[:3], 1):
-                        line = f"{i}. {f['name']}"
-                        if f.get("email"):
-                            line += f" ({f['email']})"
-                        lines.append(line)
-                    lines.append("لو سمحت اعطني الكلية أو القسم أو المسمى الوظيفي عشان أحدد بدقة.")
-                    summary = "\n".join(lines)
-            else:
-                summary = result.get("message", "لم أجد نتائج.")
-            return {
-                "ok": True,
-                "found": result["found"],
-                "count": result.get("count", 0),
-                "summary": summary,
-                "results": result.get("results", []),
-            }
-        except Exception as exc:
-            log.error("[Haseef tool] search_ksu_faculty failed: %s", exc)
-            return {"ok": False, "error": str(exc), "summary": f"خطأ في البحث: {exc}"}
 
     async def _handle_look_around(
         self, args: Dict[str, Any], ctx: Dict[str, Any]
