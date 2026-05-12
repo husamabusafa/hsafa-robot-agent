@@ -59,7 +59,18 @@ log = logging.getLogger("main_hsafa")
 # ---------------------------------------------------------------------------
 # Gemini system prompt
 # ---------------------------------------------------------------------------
-def build_gemini_system_prompt() -> str:
+def build_gemini_system_prompt(memory_snapshot: str = "") -> str:
+    snapshot_block = ""
+    if memory_snapshot.strip():
+        snapshot_block = (
+            "\n=== WHAT YOU ALREADY KNOW (Haseef's memory snapshot) ===\n"
+            "Use this freely in conversation. It is YOUR memory too — you and "
+            "Haseef share one mind. If a question can be answered from this "
+            "snapshot, answer directly without queueing Haseef. If something "
+            "feels stale or missing, call recall_memory(query) for a fresh "
+            "search.\n\n"
+            f"{memory_snapshot.strip()}\n"
+        )
     return (
         "You are Hsafa — a friendly, curious robot. You are the voice, eyes, "
         "and ears of the robot. You see through the camera in real-time, hear "
@@ -81,6 +92,12 @@ def build_gemini_system_prompt() -> str:
         "    you.\n\n"
         "- remember_fact(text, category?):\n"
         "    Store a fact in memory. Fast, returns instantly.\n\n"
+        "- recall_memory(query, limit?):\n"
+        "    Search Haseef's semantic memory directly. Fast (single REST\n"
+        "    call), no thinker run. Use when the snapshot below doesn't\n"
+        "    have what you need (e.g. 'what did I say about my project\n"
+        "    last week?'). Prefer this over queue_thinker_task for pure\n"
+        "    recall questions.\n\n"
         "- get_current_time():\n"
         "    Current date and time.\n\n"
         "- ping():\n"
@@ -131,6 +148,7 @@ def build_gemini_system_prompt() -> str:
         "4. Be warm, concise, and conversational.\n"
         "5. You ARE the eyes — answer visual questions directly from the camera.\n"
         "6. Only send tasks to Haseef for physical movement, complex memory, or questions you cannot answer directly.\n"
+        + snapshot_block
     )
 
 
@@ -191,6 +209,29 @@ def build_gemini_tools() -> list[genai_types.Tool]:
                         ),
                     },
                     required=["text"],
+                ),
+            ),
+            genai_types.FunctionDeclaration(
+                name="recall_memory",
+                description=(
+                    "Search Haseef's semantic memory for facts matching a "
+                    "query. Returns instantly (single REST call, no thinker "
+                    "run). Use this for recall questions when the snapshot "
+                    "in your system prompt is insufficient."
+                ),
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "query": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Natural-language search query.",
+                        ),
+                        "limit": genai_types.Schema(
+                            type=genai_types.Type.INTEGER,
+                            description="Max results (default 8, max 20).",
+                        ),
+                    },
+                    required=["query"],
                 ),
             ),
             genai_types.FunctionDeclaration(
@@ -569,6 +610,8 @@ class UnifiedBridge:
             return await self._handle_queue_thinker_task(args)
         elif name == "remember_fact":
             return await self._handle_remember_fact(args)
+        elif name == "recall_memory":
+            return await self._handle_recall_memory(args)
         elif name == "get_current_time":
             return self._handle_get_current_time()
         elif name == "ping":
@@ -633,12 +676,125 @@ class UnifiedBridge:
             log.error("Failed to store fact: %s", e)
             return {"ok": False, "error": str(e)}
 
+    async def _handle_recall_memory(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        query = (args.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "error": "query is required"}
+        try:
+            limit = int(args.get("limit") or 8)
+        except (TypeError, ValueError):
+            limit = 8
+        limit = max(1, min(20, limit))
+        try:
+            results = await self._run_sdk_on_main(
+                self.haseef_sdk.memory.search(self.haseef_id, query, limit)
+            )
+        except Exception as e:
+            log.error("[Gemini tool] recall_memory failed: %s", e)
+            return {"ok": False, "error": str(e)}
+
+        # Normalize to a compact, voice-friendly shape.
+        hits = []
+        for m in results or []:
+            if not isinstance(m, dict):
+                continue
+            hits.append({
+                "key": m.get("key"),
+                "value": m.get("value"),
+                "category": m.get("category"),
+            })
+        log.info("[Gemini tool] recall_memory '%s' -> %d hits", query[:60], len(hits))
+        return {"ok": True, "query": query, "count": len(hits), "results": hits}
+
     def _handle_get_current_time(self) -> Dict[str, Any]:
         now = datetime.datetime.now(datetime.timezone.utc)
         return {
             "iso": now.isoformat(),
             "human": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
+
+
+# ---------------------------------------------------------------------------
+# Memory snapshot for Gemini's system prompt
+# ---------------------------------------------------------------------------
+async def build_memory_snapshot(
+    sdk: Any,
+    haseef_id: str,
+    *,
+    semantic_limit: int = 40,
+    social_limit: int = 20,
+) -> str:
+    """Render a compact, human-readable snapshot of Haseef's memory.
+
+    Pulled once at boot and embedded in Gemini's system prompt so Gemini can
+    answer simple recall questions without a thinker round-trip.
+    """
+    sections: list[str] = []
+
+    # --- Identity / profile ------------------------------------------------
+    try:
+        h = await sdk.haseef.get(haseef_id)
+        name = h.get("name") or "Haseef"
+        desc = h.get("description") or ""
+        identity = [f"Haseef name: {name}"]
+        if desc:
+            identity.append(f"Description: {desc}")
+        try:
+            profile = await sdk.haseef.get_profile(haseef_id)
+            if isinstance(profile, dict) and profile:
+                for k, v in profile.items():
+                    if v in (None, "", [], {}):
+                        continue
+                    identity.append(f"{k}: {v}")
+        except Exception as e:
+            log.debug("[snapshot] profile fetch failed: %s", e)
+        sections.append("[Identity]\n" + "\n".join(identity))
+    except Exception as e:
+        log.warning("[snapshot] haseef.get failed: %s", e)
+
+    # --- Semantic facts ----------------------------------------------------
+    try:
+        memories = await sdk.memory.list(haseef_id) or []
+        if memories:
+            lines = []
+            for m in memories[:semantic_limit]:
+                if not isinstance(m, dict):
+                    continue
+                val = m.get("value") or m.get("key") or ""
+                cat = m.get("category")
+                if not val:
+                    continue
+                lines.append(f"- ({cat}) {val}" if cat else f"- {val}")
+            if lines:
+                sections.append("[Facts]\n" + "\n".join(lines))
+    except Exception as e:
+        log.warning("[snapshot] memory.list failed: %s", e)
+
+    # --- Social: known people ---------------------------------------------
+    try:
+        people = await sdk.memory.social(haseef_id) or []
+        if people:
+            lines = []
+            for p in people[:social_limit]:
+                if not isinstance(p, dict):
+                    continue
+                pname = p.get("name") or p.get("key") or "?"
+                rel = p.get("relationship") or p.get("role") or ""
+                notes = p.get("notes") or p.get("value") or ""
+                bits = [pname]
+                if rel:
+                    bits.append(f"({rel})")
+                if notes:
+                    bits.append(f"— {notes}")
+                lines.append("- " + " ".join(bits))
+            if lines:
+                sections.append("[People you know]\n" + "\n".join(lines))
+    except Exception as e:
+        log.warning("[snapshot] memory.social failed: %s", e)
+
+    return "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -857,13 +1013,27 @@ async def main() -> None:
                 robot.notify_audio(samples)
             media.push_audio_sample(samples)
 
+        # --- Memory snapshot for Gemini ------------------------------------
+        try:
+            memory_snapshot = await build_memory_snapshot(haseef_sdk, haseef_id)
+            if memory_snapshot:
+                log.info(
+                    "[Memory] Snapshot built (%d chars):\n%s",
+                    len(memory_snapshot), memory_snapshot,
+                )
+            else:
+                log.info("[Memory] Snapshot is empty (no memories yet).")
+        except Exception as e:
+            log.warning("[Memory] snapshot build failed: %s", e)
+            memory_snapshot = ""
+
         # --- Gemini Live ----------------------------------------------------
         gemini = GeminiLiveSession(
             api_key=api_key,
             mic_source=mic_source,
             speaker_sink=speaker_sink,
             frame_source=frame_source,
-            system_instruction=build_gemini_system_prompt(),
+            system_instruction=build_gemini_system_prompt(memory_snapshot),
             tools=build_gemini_tools(),
             tool_handler=bridge.gemini_tool_handler,
         )
