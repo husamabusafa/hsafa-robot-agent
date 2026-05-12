@@ -558,23 +558,26 @@ class FaceModule:
     def stop_following(self) -> Dict[str, Any]:
         with self._follow_lock:
             self._follow_target = None
+        # Release the base so idle animation re-centers naturally.
         try:
-            if self._robot is not None:
-                self._robot._expression_active.clear()
+            if self._robot is not None and hasattr(self._robot, "set_follow_base"):
+                self._robot.set_follow_base(None, None)
         except Exception:
             pass
         return {"ok": True}
 
     def _follow_loop(self) -> None:
-        try:
-            from reachy_mini.utils import create_head_pose
-        except ImportError:
-            log.warning("reachy_mini.utils unavailable; cannot follow.")
-            return
+        """Drive the robot's follow-base yaw/pitch.
+
+        We do NOT call ``set_target_head_pose`` directly — instead we push a
+        smoothed yaw/pitch into ``RobotController.set_follow_base``. The
+        controller's idle/speaking loop adds its expressive deltas (bobs,
+        glances, antenna sway) ON TOP of this base, so face-following
+        composes with animations rather than freezing them.
+        """
         period = 1.0 / FOLLOW_HZ
         cur_yaw = 0.0
         cur_pitch = 0.0
-        was_active = False
         # Rough camera intrinsics (Reachy Mini): full HFOV ~60°, VFOV ~45°.
         FOV_H = 60.0
         FOV_V = 45.0
@@ -582,13 +585,12 @@ class FaceModule:
             with self._follow_lock:
                 target = self._follow_target
             if target is None:
-                if was_active:
-                    try:
-                        if self._robot is not None:
-                            self._robot._expression_active.clear()
-                    except Exception:
-                        pass
-                    was_active = False
+                try:
+                    if (self._robot is not None
+                            and hasattr(self._robot, "set_follow_base")):
+                        self._robot.set_follow_base(None, None)
+                except Exception:
+                    pass
                 return
 
             with self._latest_lock:
@@ -612,35 +614,26 @@ class FaceModule:
                         break
 
             if chosen is not None and self._robot is not None:
-                if not was_active:
-                    try:
-                        self._robot._expression_active.set()
-                    except Exception:
-                        pass
-                    was_active = True
                 cx = 0.5 * (chosen.bbox[0] + chosen.bbox[2])
                 cy = 0.5 * (chosen.bbox[1] + chosen.bbox[3])
                 err_x = (cx - frame_w / 2.0) / (frame_w / 2.0)
                 err_y = (cy - frame_h / 2.0) / (frame_h / 2.0)
-                # In the robot frame: positive yaw is LEFT. The camera image
-                # is un-mirrored, so a face appearing on the RIGHT side of
-                # the frame (err_x > 0) is physically to the robot's right
-                # → we need a NEGATIVE yaw delta to look at it.
+                # Robot frame: positive yaw = LEFT. Face on RIGHT side of
+                # frame (err_x > 0) is physically to robot's right → need
+                # NEGATIVE yaw delta.
                 desired_yaw = cur_yaw - err_x * (FOV_H / 2.0) * 0.45
                 desired_pitch = cur_pitch + err_y * (FOV_V / 2.0) * 0.45
                 desired_yaw = max(-60.0, min(60.0, desired_yaw))
                 desired_pitch = max(-30.0, min(30.0, desired_pitch))
-                # Smooth motion
+                # Smooth motion (P-controller-ish)
                 cur_yaw += (desired_yaw - cur_yaw) * 0.4
                 cur_pitch += (desired_pitch - cur_pitch) * 0.4
                 try:
-                    pose = create_head_pose(
-                        yaw=cur_yaw, pitch=cur_pitch, roll=0.0,
-                        degrees=True, mm=True,
-                    )
-                    self._robot.reachy.set_target_head_pose(pose)
+                    if hasattr(self._robot, "set_follow_base"):
+                        self._robot.set_follow_base(cur_yaw, cur_pitch)
                 except Exception as e:
-                    log.warning("follow pose failed: %s", e)
+                    log.warning("follow base update failed: %s", e)
+            # If chosen is None, we keep the last base (head holds position).
             time.sleep(period)
 
 

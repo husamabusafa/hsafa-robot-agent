@@ -110,6 +110,31 @@ class RobotController:
         self._speech_amp = 0.0
         self._stop_idle = threading.Event()
         self._idle_thread: Optional[threading.Thread] = None
+        # Face-following base pose. When non-None, the idle/speaking loop
+        # adds its expressive deltas ON TOP of this base instead of around
+        # zero — so following composes with animations.
+        self._follow_base_yaw: Optional[float] = None
+        self._follow_base_pitch: Optional[float] = None
+        self._follow_lock = threading.Lock()
+
+    # ---- face follow base --------------------------------------------------
+    def set_follow_base(
+        self, yaw_deg: Optional[float], pitch_deg: Optional[float],
+    ) -> None:
+        """Set (or clear) the base head direction the animations layer on top of.
+
+        Pass ``(None, None)`` to release. Called from FaceModule's follow loop.
+        """
+        with self._follow_lock:
+            self._follow_base_yaw = yaw_deg
+            self._follow_base_pitch = pitch_deg
+
+    def _get_follow_base(self) -> tuple[float, float]:
+        with self._follow_lock:
+            return (
+                self._follow_base_yaw or 0.0,
+                self._follow_base_pitch or 0.0,
+            )
 
     def bind_speaking_event(self, event: threading.Event) -> None:
         """Drive the speaking animation directly from a threading.Event.
@@ -211,10 +236,11 @@ class RobotController:
                 if emphasis_decay > 0.01:
                     emphasis_decay *= 0.96  # fade ~1.5 s
 
+                base_yaw, base_pitch = self._get_follow_base()
                 pose = create_head_pose(
                     z=bob_z,
-                    pitch=bob_pitch,
-                    yaw=drift_yaw + emphasis_yaw * emphasis_decay,
+                    pitch=base_pitch + bob_pitch,
+                    yaw=base_yaw + drift_yaw + emphasis_yaw * emphasis_decay,
                     roll=drift_roll,
                     degrees=True,
                     mm=True,
@@ -237,10 +263,11 @@ class RobotController:
                 yaw_off += (target_yaw - yaw_off) * 0.015
                 roll = 0.7 * math.sin(2 * math.pi * t / 9.0)
 
+                base_yaw, base_pitch = self._get_follow_base()
                 pose = create_head_pose(
                     roll=roll,
-                    pitch=0.0,
-                    yaw=yaw_off,
+                    pitch=base_pitch,
+                    yaw=base_yaw + yaw_off,
                     degrees=True,
                     mm=True,
                 )
