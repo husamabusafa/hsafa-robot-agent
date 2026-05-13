@@ -39,6 +39,7 @@ log = logging.getLogger("face_module")
 # ---------------------------------------------------------------------------
 HIGH_THRESHOLD = 0.48       # confident named match (typical ArcFace ~0.45-0.50)
 LOW_THRESHOLD = 0.28        # below this we don't even hint a candidate
+MARGIN = 0.05               # min gap between best and second-best for confident match
 MAX_GALLERY = 50            # max embeddings stored per name
 DUP_THRESHOLD = 0.96        # skip enrollment of near-duplicate embeddings
 DETECT_HZ = 8               # face detection cadence

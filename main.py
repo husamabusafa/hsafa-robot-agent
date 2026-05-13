@@ -1291,30 +1291,10 @@ async def main() -> None:
         def _latest_frame_getter() -> Optional[np.ndarray]:
             return latest_frame
 
-        def _on_face_event(name: str, data: Dict[str, Any], jpeg_bytes: Optional[bytes]) -> None:
-            """Bridge face-module events into Haseef as image-attached messages.
-
-            Runs in the face-detect thread; we hop back to main_loop to call
-            the SDK.  Suppress proactive face events for 10 s after a thinker
-            task so Haseef isn't distracted while handling a user request.
-            """
-            if not jpeg_bytes:
-                return
-            if time.time() - bridge._last_task_ts < 10.0:
-                log.debug("[face-event] suppressed (%s) — task in flight", name)
-                return
-            jpeg_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-            note = f"[{name}] {data.get('note', '')}".strip()
-            try:
-                if main_loop and not main_loop.is_closed():
-                    asyncio.run_coroutine_threadsafe(
-                        bridge._push_image_event(jpeg_b64, note=note),
-                        main_loop,
-                    )
-            except Exception as e:
-                log.warning("[face-event] dispatch failed: %s", e)
-
-        face_module = FaceModule(on_event=_on_face_event)
+        # Proactive face events (face.new_unknown / face.identity_uncertain)
+        # are disabled for now — Haseef should only react when the user speaks,
+        # not greet on its own when the face module sees a borderline match.
+        face_module = FaceModule(on_event=None)
         try:
             face_module.start(_latest_frame_getter, robot)
             bridge.face = face_module
